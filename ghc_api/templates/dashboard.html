@@ -478,6 +478,7 @@
                 Code Agent Manager
                 <span id="config-manager-alert" class="config-manager-alert">!</span>
             </button>
+            <a href="/live">Live Throughput</a>
             <a href="/requests">Request Browser</a>
             <a href="/chat">Chat</a>
             <a href="/agent">Code Agent</a>
@@ -592,6 +593,8 @@
                         <th>State</th>
                         <th>Status</th>
                         <th>Duration</th>
+                        <th>TTFT</th>
+                        <th>Speed</th>
                         <th>Request Size</th>
                         <th>Response Size</th>
                     </tr>
@@ -690,6 +693,31 @@
                 return '…';
             }
             return (item.duration !== null && item.duration !== undefined) ? `${item.duration}s` : '-';
+        }
+
+        // Output decode speed: tokens per second of generation time (total
+        // duration minus time to first token), so upstream queueing shows up in
+        // TTFT rather than depressing the measured speed.
+        function formatTokensPerSecond(item) {
+            let value = item.tokens_per_second;
+            if (value === null || value === undefined) {
+                const outputTokens = Number(item.output_tokens || 0);
+                const duration = Number(item.duration || 0);
+                const ttft = (item.ttft === null || item.ttft === undefined) ? 0 : Number(item.ttft);
+                const generating = duration - ttft;
+                if (!outputTokens || generating < 0.05) {
+                    return '-';
+                }
+                value = outputTokens / generating;
+            }
+            return `${Number(value).toFixed(1)}`;
+        }
+
+        function formatTtft(item) {
+            if (item.ttft === null || item.ttft === undefined) {
+                return '-';
+            }
+            return `${Number(item.ttft).toFixed(2)}s`;
         }
 
         function syntaxHighlight(json) {
@@ -887,6 +915,8 @@
                         <td><span class="state-badge ${state}">${getStateLabel(state)}</span></td>
                         <td>${statusCode}</td>
                         <td>${duration}</td>
+                        <td>${formatTtft(item)}</td>
+                        <td>${formatTokensPerSecond(item)}</td>
                         <td>${formatBytes(item.request_size)}</td>
                         <td>${formatBytes(item.response_size)}</td>
                     `;

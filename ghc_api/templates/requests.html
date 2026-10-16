@@ -889,6 +889,7 @@
         <h1>Request Browser</h1>
         <div class="navbar-actions">
             <a href="/">Dashboard</a>
+            <a href="/live">Live Throughput</a>
             <a href="/chat">Chat</a>
             <a href="/agent">Code Agent</a>
             <a href="/request-stats">Request Stats</a>
@@ -1076,6 +1077,38 @@
                 return '…';
             }
             return (item.duration !== null && item.duration !== undefined) ? `${item.duration}s` : '-';
+        }
+
+        // Output decode speed: tokens per second of generation time (duration
+        // minus time to first token). Computed server-side; recomputed here only
+        // for older cached/imported entries that predate the field.
+        function computeTokensPerSecond(item) {
+            if (item.tokens_per_second !== null && item.tokens_per_second !== undefined) {
+                return Number(item.tokens_per_second);
+            }
+            const outputTokens = Number(item.output_tokens || 0);
+            const duration = Number(item.duration || 0);
+            if (!outputTokens || !duration) {
+                return null;
+            }
+            const ttft = (item.ttft === null || item.ttft === undefined) ? 0 : Number(item.ttft);
+            const generating = duration - ttft;
+            if (generating < 0.05) {
+                return null;
+            }
+            return outputTokens / generating;
+        }
+
+        function formatTokensPerSecond(item) {
+            const value = computeTokensPerSecond(item);
+            return value === null ? '-' : `${value.toFixed(1)} tok/s`;
+        }
+
+        function formatTtft(item) {
+            if (item.ttft === null || item.ttft === undefined) {
+                return '-';
+            }
+            return `${Number(item.ttft).toFixed(2)}s`;
         }
 
         function escapeHtml(text) {
@@ -1710,6 +1743,7 @@
                                 </div>
                                 <div class="request-item-stats">
                                     <span>Duration: ${duration}</span>
+                                    <span>TTFT: ${formatTtft(item)} / ${formatTokensPerSecond(item)}</span>
                                     <span>In: ${formatNumber(item.input_tokens + (item.cache_creation_input_tokens || 0) + (item.cache_read_input_tokens || 0))}${item.cache_creation_input_tokens ? ` / Cache+: ${formatNumber(item.cache_creation_input_tokens)}` : ''}${item.cache_read_input_tokens ? ` / Cache: ${formatNumber(item.cache_read_input_tokens)}` : ''} / Out: ${formatNumber(item.output_tokens)}</span>
                                 </div>
                                 <div class="request-item-stats">
@@ -1928,6 +1962,14 @@
                 <div class="overview-item">
                     <label>Duration</label>
                     <div class="value">${duration}</div>
+                </div>
+                <div class="overview-item">
+                    <label>Time To First Token</label>
+                    <div class="value">${formatTtft(data)}</div>
+                </div>
+                <div class="overview-item">
+                    <label>Output Speed</label>
+                    <div class="value">${formatTokensPerSecond(data)}</div>
                 </div>
                 <div class="overview-item">
                     <label>Request Size</label>
