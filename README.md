@@ -770,6 +770,23 @@ Access the web dashboard at `http://localhost:8313/` to:
   - Browse sessions across machines via OneDrive
   - Resume viewing past session history
 
+### Shared navigation
+
+Every page renders the same top bar from `ghc_api/static/nav.js` and `nav.css`, so a new page appears in the nav everywhere at once instead of only where someone remembered to add a link. Frequent destinations (Dashboard, Live Throughput, Request Browser, Chat, Code Agent Manager) sit inline; occasional ones (Runtime Config Override, Code Agent, Request Stats, and the raw JSON stats endpoints) live behind the **Other** menu.
+
+A template only declares its title and any page-specific buttons:
+
+```html
+<nav class="navbar" id="app-nav" data-title="Request Browser">
+    <template id="nav-extras">
+        <button onclick="downloadRequests()">Download .jl</button>
+    </template>
+</nav>
+<script src="{{ url_for('static', filename='nav.js') }}"></script>
+```
+
+The active entry is derived from the current path (`data-active="/request-stats"` overrides it for detail pages), and the measured bar height is published as the `--nav-height` CSS variable for the full-height pages. "Runtime Config Override" opens the modal in place on the dashboard and links to `/#runtime-config` from anywhere else.
+
 ## Production deployment
 
 When you expose ghc-api beyond `localhost` (sharing a single instance with other people, putting it on a VPS, etc.), put a reverse proxy in front to authenticate admin paths. ghc-api intentionally does **not** authenticate dashboard pages or admin APIs at the Flask layer — that responsibility is delegated to your reverse proxy.
