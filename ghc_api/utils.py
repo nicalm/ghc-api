@@ -423,13 +423,15 @@ def _strip_encrypted_content(value: Any, depth: int = 0) -> Tuple[Any, bool]:
         changed = False
         result = []
         for element in value:
-            # A content block that carries encrypted data is meaningless once the
-            # payload is gone, so drop the block rather than leaving a husk behind.
-            if isinstance(element, dict) and _contains_encrypted_content(element, depth + 1):
+            # Only an encrypted block is disposable. A surrounding text/media
+            # block may carry both plaintext and a nested encrypted field.
+            if isinstance(element, dict) and element.get("type") == "encrypted_content":
                 changed = True
                 continue
             new_element, element_changed = _strip_encrypted_content(element, depth + 1)
             changed = changed or element_changed
+            if element_changed and isinstance(new_element, dict) and not new_element:
+                continue
             result.append(new_element)
         return result, changed
 
@@ -457,8 +459,10 @@ def remove_encrypted_content_items(request_input: Any) -> Tuple[Any, int]:
     output content blocks. Dropping a whole ``function_call_output`` would orphan its
     ``function_call`` and make the retry fail with "No tool output found for function
     call", so tool outputs are sanitized in place (with a placeholder body) instead of
-    being deleted. Any other item carrying encrypted content is removed outright, and
-    if a tool *call* itself has to go, its paired output is removed with it.
+    being deleted. Messages (including agent messages) retain their non-encrypted
+    content and metadata; an emptied message is dropped rather than sent as a shell.
+    Reasoning and other encrypted item types are still removed outright. If a tool
+    *call* itself has to go, its paired output is removed with it.
 
     Returns the cleaned input and the number of items that were removed or rewritten.
     """
@@ -475,6 +479,18 @@ def remove_encrypted_content_items(request_input: Any) -> Tuple[Any, int]:
             continue
 
         item_type = item.get("type")
+        if item_type in ("message", "agent_message") or (
+            item_type is None and "role" in item and "content" in item
+        ):
+            sanitized, _ = _strip_encrypted_content(item)
+            content = sanitized.get("content")
+            if (isinstance(content, list) and content) or (
+                isinstance(content, str) and content.strip()
+            ):
+                cleaned_input.append(sanitized)
+            changed_count += 1
+            continue
+
         if item_type in _TOOL_OUTPUT_ITEM_TYPES:
             sanitized, _ = _strip_encrypted_content(item)
             cleaned_input.append(_ensure_tool_output_present(sanitized))

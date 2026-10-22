@@ -1,4 +1,5 @@
 import contextlib
+import copy
 import json
 import queue
 import unittest
@@ -132,23 +133,35 @@ class EncryptedContentHelpersTest(unittest.TestCase):
             )
         )
 
-    def test_removes_items_with_direct_or_nested_encrypted_content(self):
+    def test_preserves_plaintext_in_mixed_agent_message(self):
         request_input = [
             {"type": "message", "content": [{"type": "input_text", "text": "keep"}]},
             {"type": "reasoning", "encrypted_content": "bad", "summary": []},
             {
                 "type": "agent_message",
+                "id": "amsg-1",
+                "author": "/root/reviewer",
+                "recipient": "/root",
                 "content": [
                     {"type": "input_text", "text": "nested"},
                     {"type": "encrypted_content", "encrypted_content": "bad"},
                 ],
             },
         ]
+        original = copy.deepcopy(request_input)
 
         cleaned, removed_count = remove_encrypted_content_items(request_input)
 
-        self.assertEqual(cleaned, [request_input[0]])
+        self.assertEqual(cleaned, [
+            request_input[0],
+            {
+                "type": "agent_message", "id": "amsg-1",
+                "author": "/root/reviewer", "recipient": "/root",
+                "content": [{"type": "input_text", "text": "nested"}],
+            },
+        ])
         self.assertEqual(removed_count, 2)
+        self.assertEqual(request_input, original)
 
     def test_function_call_output_is_sanitized_not_dropped(self):
         request_input = [
@@ -176,6 +189,71 @@ class EncryptedContentHelpersTest(unittest.TestCase):
                 "output": [{"type": "output_text", "text": "keep me"}],
             },
         )
+
+    def test_nested_mixed_blocks_keep_plaintext_and_media(self):
+        for item_type, body_key in (
+            ("message", "content"),
+            ("agent_message", "content"),
+            ("function_call_output", "output"),
+        ):
+            with self.subTest(item_type=item_type):
+                item = {
+                    "type": item_type, "id": "item-1",
+                    body_key: [
+                        {"type": "input_text", "text": "keep text", "encrypted_content": "bad"},
+                        {
+                            "type": "input_image", "image_url": "https://example.invalid/image.png",
+                            "metadata": {"label": "keep label", "encrypted_content": "bad"},
+                        },
+                        {"type": "encrypted_content", "encrypted_content": "bad"},
+                    ],
+                }
+                original = copy.deepcopy(item)
+                cleaned, changed_count = remove_encrypted_content_items([item])
+
+                self.assertEqual(cleaned, [{
+                    "type": item_type, "id": "item-1",
+                    body_key: [
+                        {"type": "input_text", "text": "keep text"},
+                        {
+                            "type": "input_image", "image_url": "https://example.invalid/image.png",
+                            "metadata": {"label": "keep label"},
+                        },
+                    ],
+                }])
+                self.assertEqual(changed_count, 1)
+                self.assertEqual(item, original)
+
+    def test_message_variants_keep_their_plaintext_and_identity(self):
+        for identity in (
+            {"type": "message", "role": "assistant", "id": "msg-1", "phase": "commentary"},
+            {"type": "agent_message", "id": "amsg-1", "author": "/root/reviewer", "recipient": "/root"},
+            {"role": "user"},  # Responses message.type is optional.
+        ):
+            for body in ("keep this text", [{"type": "input_text", "text": "keep this text"}]):
+                with self.subTest(identity=identity, body=body):
+                    expected = {**identity, "content": body}
+                    original = {**expected, "encrypted_content": "bad"}
+                    cleaned, changed_count = remove_encrypted_content_items([original])
+
+                    self.assertEqual(cleaned, [expected])
+                    self.assertEqual(changed_count, 1)
+                    self.assertEqual(original["encrypted_content"], "bad")
+                    self.assertEqual(remove_encrypted_content_items(cleaned), (cleaned, 0))
+
+    def test_encrypted_only_messages_are_removed_without_empty_shells(self):
+        for item_type in ("message", "agent_message"):
+            for body in (
+                [{"type": "encrypted_content", "encrypted_content": "bad"}],
+                [{"encrypted_content": "bad"}],
+                "", "   ", [], None,
+            ):
+                with self.subTest(item_type=item_type, body=body):
+                    item = {
+                        "type": item_type, "id": "item-1",
+                        "content": body, "encrypted_content": "bad",
+                    }
+                    self.assertEqual(remove_encrypted_content_items([item]), ([], 1))
 
     def test_emptied_function_call_output_gets_placeholder(self):
         request_input = [
@@ -317,7 +395,12 @@ class EncryptedContentRouteRetryTest(EncryptedContentTestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(post.call_count, 2)
-        self.assertEqual(post.call_args_list[1][1]["json"]["input"], [payload["input"][0]])
+        self.assertEqual(post.call_args_list[1][1]["json"]["input"], [
+            payload["input"][0],
+            {"type": "agent_message", "content": [{"type": "input_text", "text": "tool output"}]},
+        ])
+        record = cache.get_recent_requests(1)[0]
+        self.assertEqual(record["original_request_body"], payload)
         self.assertEqual(counters.snapshot()["mod.encrypted_content_removal"], 1)
         self.assertTrue(error_response.closed, "failed upstream response must be closed")
 
@@ -410,6 +493,19 @@ class EncryptedContentStreamRetryTest(EncryptedContentTestCase):
                     {"type": "output_text", "text": "visible tool result"},
                     {"type": "encrypted_content", "encrypted_content": "bad"},
                 ]},
+                {
+                    "type": "agent_message", "id": "amsg-1",
+                    "author": "/root/reviewer", "recipient": "/root",
+                    "content": [
+                        {"type": "input_text", "text": "visible agent result"},
+                        {"type": "encrypted_content", "encrypted_content": "bad"},
+                    ],
+                },
+                {
+                    "type": "message", "role": "assistant", "id": "msg-1",
+                    "content": [{"type": "output_text", "text": "visible assistant result"}],
+                    "encrypted_content": "bad",
+                },
             ],
         }
 
@@ -483,6 +579,17 @@ class EncryptedContentStreamRetryTest(EncryptedContentTestCase):
                         "type": "function_call_output", "call_id": "call_1",
                         "output": [{"type": "output_text", "text": "visible tool result"}],
                     })
+                    self.assertEqual(sent["input"][3:], [
+                        {
+                            "type": "agent_message", "id": "amsg-1",
+                            "author": "/root/reviewer", "recipient": "/root",
+                            "content": [{"type": "input_text", "text": "visible agent result"}],
+                        },
+                        {
+                            "type": "message", "role": "assistant", "id": "msg-1",
+                            "content": [{"type": "output_text", "text": "visible assistant result"}],
+                        },
+                    ])
                     self.assertIn("encrypted_content", json.dumps(post.call_args_list[0].kwargs["json"]))
                     self.assertTrue(failure.closed)
                     self.assertTrue(success.closed)

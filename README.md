@@ -233,10 +233,14 @@ fails again.
 Set `auto_remove_encrypted_content_on_parse_error: true` to let ghc-api recover from either
 form exactly once per request, before any model output has been forwarded:
 
-- Items whose encrypted payload *is* the content (reasoning items, messages) are dropped.
+- Messages and agent messages keep their plaintext, other non-encrypted content, and
+  identity fields. Only encrypted blocks/fields are removed, including inside mixed
+  content blocks. Messages with no content left are dropped; encrypted reasoning
+  items and other unsupported encrypted item types are still dropped.
 - Tool output items (`function_call_output`, `custom_tool_call_output`, ...) are **kept** with
-  their encrypted blocks stripped and a placeholder body, so the paired `function_call` is not
-  orphaned (removing them would make the retry fail with "No tool output found for function call").
+  their encrypted blocks stripped; a placeholder body is used only if the output becomes
+  empty, so the paired `function_call` is not orphaned (removing it would make the retry
+  fail with "No tool output found for function call").
 - If a tool *call* itself must be dropped, its paired output is dropped with it.
 - The cleaned request is retried once; the retry does not consume the connection-retry budget,
   and a second identical failure is returned to the client as-is.
@@ -249,9 +253,10 @@ form exactly once per request, before any model output has been forwarded:
 - Explicit invalid-request errors are not retried with the same input. Once text, reasoning,
   or tool-call output has been forwarded, the stream is never replayed.
 
-The option is **off by default** because it is lossy — the model loses that reasoning/tool
-context — and costs one extra upstream request. Every recovery is counted
-(`mod.encrypted_content_removal`) and logged.
+The option is **off by default** because it is lossy — the model still loses encrypted
+reasoning/content, although surviving message text is preserved — and costs one extra
+upstream request. Cleanup changes only the forwarded request copy, not the original
+request history. Every recovery is counted (`mod.encrypted_content_removal`) and logged.
 
 This recovery covers the OpenAI-format endpoints, where ghc-api holds the reasoning state.
 It does **not** cover the Anthropic Messages compatibility path, where the state is carried
