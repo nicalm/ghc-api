@@ -182,6 +182,9 @@ responses_pre_header_grace: 0.5
 # (function_call_output etc.) keep their place, using a placeholder only if empty so
 # the paired function_call is not orphaned. This loses encrypted context and costs
 # one extra upstream request, so it is disabled by default.
+# Successful completed recovery remembers ciphertext hashes for the same explicit
+# client_metadata.thread_id (scoped by user/upstream/model) for up to 24h in memory.
+# Later requests preclean only those old blocks; new encrypted content is preserved.
 auto_remove_encrypted_content_on_parse_error: false
 
 # If true, each completed request is appended to requests/YYYY-MM-DD.jl in the ghc-api config folder.

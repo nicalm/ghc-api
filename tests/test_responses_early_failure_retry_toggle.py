@@ -56,7 +56,7 @@ class ResponsesEarlyFailureRetryToggleTest(unittest.TestCase):
                 mock.patch.object(openai_routes, "get_copilot_headers", return_value={}), \
                 mock.patch.object(openai_routes, "get_copilot_base_url", return_value="https://upstream.test"), \
                 mock.patch.object(openai_routes.requests, "post", return_value=_FakeUpstreamResponse()), \
-                mock.patch.object(openai_routes, "OpenAIResponsesStreamHandler", side_effect=fake_handler):
+                mock.patch.object(openai_routes, "_RecoveryStreamHandler", side_effect=fake_handler):
             with self.app.test_client() as client:
                 client.post("/v1/responses", json={
                     "model": "gpt-5",

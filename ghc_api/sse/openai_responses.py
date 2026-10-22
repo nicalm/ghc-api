@@ -7,11 +7,13 @@ the base handler retains the original upstream payloads in the request cache.
 """
 
 import json
+import re
 import threading
 from typing import Callable, Dict, Iterator, Optional
 
 import requests
 
+from ..utils import is_encrypted_content_error
 from .base import SSEStreamHandler
 
 
@@ -28,6 +30,10 @@ class RetryingResponsesResponse:
     independently of the transient retry budget. It must bound its own retries.
     Keep a trailing error diagnostic with the failed preamble so invalid input
     is never blindly retried, and the original error survives failed recovery.
+
+    on_diagnostic receives stage/code/status metadata without upstream content.
+    Set initial_after_recovery if the caller already recovered an HTTP error.
+    A completed diagnostic requires the actual response.completed event.
     """
 
     _PRE_OUTPUT_EVENTS = {
@@ -45,13 +51,19 @@ class RetryingResponsesResponse:
         max_retries: int,
         request_id: str,
         error_response_factory: Optional[Callable[[Dict], Optional[requests.Response]]] = None,
+        on_diagnostic: Optional[Callable[[Dict], None]] = None,
+        initial_after_recovery: bool = False,
     ) -> None:
         self._response = response
         self._response_factory = response_factory
         self._max_retries = max(0, max_retries)
         self._request_id = request_id
         self._error_response_factory = error_response_factory
-        self._lock = threading.Lock()
+        self._on_diagnostic = on_diagnostic
+        self._after_recovery = initial_after_recovery
+        # Serialize callbacks with close(), allowing a callback to close the
+        # wrapper itself without deadlocking.
+        self._lock = threading.RLock()
         self._closed = False
 
         # SSEStreamHandler reads these attributes before iterating. ``text`` is a
@@ -61,6 +73,44 @@ class RetryingResponsesResponse:
         # request into a buffered one.
         self.status_code = response.status_code
         self.ok = response.ok
+
+    def _diagnostic(self, stage: str, **fields) -> None:
+        """Report only bounded metadata; diagnostics cannot affect the wire."""
+        with self._lock:
+            if self._closed or self._on_diagnostic is None:
+                return
+            try:
+                self._on_diagnostic({"stage": stage, **fields})
+            except Exception:
+                pass
+
+    @staticmethod
+    def _error_code(error) -> str:
+        code = error.get("code") if isinstance(error, dict) else None
+        if isinstance(code, str) and re.fullmatch(r"[a-z][a-z0-9_]{0,63}", code):
+            return code
+        return "unknown"
+
+    def _recover_from_error(self, error: Dict) -> Optional[requests.Response]:
+        if self._error_response_factory is None:
+            return None
+        try:
+            recovered = self._error_response_factory(error)
+        except Exception as exc:
+            self._diagnostic("recovery_started")
+            self._diagnostic("recovery_exception", error_type=type(exc).__name__)
+            # Exception messages can include tokens, URLs or upstream bodies.
+            print(
+                f"[Stream Responses] Error recovery failed for request "
+                f"{self._request_id}: {type(exc).__name__}"
+            )
+            return None
+        # Returning None means the factory declined recovery, not an attempt.
+        if recovered is not None:
+            self._diagnostic("recovery_started")
+            if not recovered.ok:
+                self._diagnostic("recovery_http_error", status_code=recovered.status_code)
+        return recovered
 
     @property
     def text(self) -> str:
@@ -121,7 +171,7 @@ class RetryingResponsesResponse:
         nested = event.get("error")
         return nested if isinstance(nested, dict) else event
 
-    def _recover_from_http_error(self, response) -> Optional[requests.Response]:
+    def _recover_from_http_error(self, response, after_recovery: bool) -> Optional[requests.Response]:
         """Offer error recovery a replay that upstream rejected in HTTP form.
 
         The same rejection arrives either as a pre-output SSE failure or as an
@@ -137,17 +187,13 @@ class RetryingResponsesResponse:
             return None
         if not isinstance(error, dict):
             return None
-        try:
-            return self._error_response_factory(error)
-        except Exception as exc:
-            print(
-                f"[Stream Responses] Error recovery failed for request "
-                f"{self._request_id}: {type(exc).__name__}: {exc}"
-            )
-            return None
+        if not after_recovery and is_encrypted_content_error(error):
+            self._diagnostic("original_rejected", error_code=self._error_code(error))
+        return self._recover_from_error(error)
 
     def iter_lines(self) -> Iterator[bytes]:
         retries = 0
+        after_recovery = self._after_recovery
 
         while True:
             response = self._current_response()
@@ -160,13 +206,18 @@ class RetryingResponsesResponse:
             early_failure = False
             terminal_error = False
             error = None
+            terminal_seen = False
+            failure_seen = False
+            rejection_reported = False
 
             while True:
                 try:
                     line = next(lines)
                 except StopIteration:
                     break
-                except requests.exceptions.RequestException:
+                except requests.exceptions.RequestException as exc:
+                    if after_recovery:
+                        self._diagnostic("recovery_exception", error_type=type(exc).__name__)
                     if not early_failure:
                         raise
                     # A broken connection while reading the optional diagnostic
@@ -177,14 +228,38 @@ class RetryingResponsesResponse:
                     break
                 if self._current_response() is None:
                     return
+                # The normal fast path need not parse output. When observed,
+                # completion/failure must also be noticed after the first delta.
+                event = self._event(line) if not output_started or self._on_diagnostic is not None else None
+                event_type = event.get("type", "") if event is not None else None
+                if event_type == "response.completed":
+                    if not terminal_seen:
+                        self._diagnostic("completed", after_recovery=after_recovery)
+                    terminal_seen = True
+                elif event_type in ("response.failed", "error"):
+                    terminal_seen = failure_seen = True
+                    failed = event.get("response")
+                    event_error = (
+                        self._error_payload(event) if event_type == "error"
+                        else failed.get("error") if isinstance(failed, dict) else None
+                    )
+                    if not rejection_reported and isinstance(event_error, dict) and event_error:
+                        if after_recovery or is_encrypted_content_error(event_error):
+                            self._diagnostic(
+                                "recovery_rejected" if after_recovery else "original_rejected",
+                                error_code=self._error_code(event_error),
+                            )
+                            rejection_reported = True
+                elif event_type == "response.incomplete":
+                    terminal_seen = True
+                if self._current_response() is None:
+                    return
                 if output_started:
                     yield line
                     continue
 
                 buffered.append(line)
                 buffered_bytes += len(line) + 1
-                event = self._event(line)
-                event_type = event.get("type", "") if event is not None else None
                 # Bound the preamble, including comments/diagnostics after a
                 # failure. Once anything is forwarded it cannot be replaced.
                 if buffered_bytes > self._MAX_BUFFERED_BYTES:
@@ -227,19 +302,13 @@ class RetryingResponsesResponse:
             retry_response = None
             if self._current_response() is None:
                 return
+            if after_recovery and failure_seen and not rejection_reported:
+                self._diagnostic("recovery_rejected", error_code="unknown")
             if isinstance(error, dict) and self._error_response_factory is not None:
-                try:
-                    retry_response = self._error_response_factory(error)
-                except Exception as exc:
-                    # Recovery is best effort. A transport failure or a failed
-                    # token refresh (RuntimeError) must not discard the buffered
-                    # upstream diagnostic, which is the more useful answer --
-                    # and token trouble is exactly what triggers this path.
-                    print(
-                        f"[Stream Responses] Error recovery failed for request "
-                        f"{self._request_id}: {type(exc).__name__}: {exc}"
-                    )
-                    retry_response = None
+                # Recovery is best effort; preserve the buffered diagnostic if
+                # token refresh or the replacement request fails.
+                retry_response = self._recover_from_error(error)
+            recovery_response = retry_response is not None
 
             invalid_request = (
                 isinstance(error, dict)
@@ -259,26 +328,32 @@ class RetryingResponsesResponse:
                 try:
                     retry_response = self._response_factory()
                 except Exception as exc:
+                    if after_recovery:
+                        self._diagnostic("recovery_exception", error_type=type(exc).__name__)
                     # The original response.failed is more useful to the
                     # downstream client than replacing it with an empty 504.
                     print(
                         f"[Stream Responses] Early-failure retry failed for request "
-                        f"{self._request_id}: {type(exc).__name__}: {exc}"
+                        f"{self._request_id}: {type(exc).__name__}"
                     )
                     retry_response = None
 
                 if retry_response is not None and not retry_response.ok:
-                    recovered = self._recover_from_http_error(retry_response)
+                    if after_recovery:
+                        self._diagnostic("recovery_http_error", status_code=retry_response.status_code)
+                    recovered = self._recover_from_http_error(retry_response, after_recovery)
                     if recovered is not None:
                         retry_response.close()
                         retry_response = recovered
                         # Recovery has its own one-shot budget; this attempt
                         # must not be charged to the connection retries.
                         generic_retry = False
+                        recovery_response = True
 
             if retry_response is not None and retry_response.ok:
                 if not self._replace_response(response, retry_response):
                     return
+                after_recovery = after_recovery or recovery_response
                 if generic_retry:
                     retries += 1
                     print(

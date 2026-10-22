@@ -1,5 +1,6 @@
 from datetime import datetime
 import json
+import hashlib
 import os
 import platform
 import time
@@ -391,30 +392,40 @@ def is_encrypted_content_error(error: Any) -> bool:
     )
 
 
-def _contains_encrypted_content(value: Any, depth: int = 0) -> bool:
+def encrypted_content_fingerprint(value: Any) -> str:
+    """Opaque equality key; never retain the original encrypted payload."""
+    return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def _contains_encrypted_content(value: Any, depth: int = 0, fingerprints=None) -> bool:
     if depth > _MAX_ENCRYPTED_SCAN_DEPTH:
         return False
     if isinstance(value, dict):
-        if "encrypted_content" in value:
+        if "encrypted_content" in value and (
+            fingerprints is None or encrypted_content_fingerprint(value["encrypted_content"]) in fingerprints
+        ):
             return True
-        return any(_contains_encrypted_content(child, depth + 1) for child in value.values())
+        return any(_contains_encrypted_content(child, depth + 1, fingerprints) for child in value.values())
     if isinstance(value, list):
-        return any(_contains_encrypted_content(child, depth + 1) for child in value)
+        return any(_contains_encrypted_content(child, depth + 1, fingerprints) for child in value)
     return False
 
 
-def _strip_encrypted_content(value: Any, depth: int = 0) -> Tuple[Any, bool]:
+def _strip_encrypted_content(value: Any, depth: int = 0, fingerprints=None) -> Tuple[Any, bool]:
     """Remove encrypted payloads while keeping the surrounding item structure intact."""
     if depth > _MAX_ENCRYPTED_SCAN_DEPTH:
         return value, False
 
     if isinstance(value, dict):
-        changed = "encrypted_content" in value
+        changed = False
         result = {}
         for key, child in value.items():
-            if key == "encrypted_content":
+            if key == "encrypted_content" and (
+                fingerprints is None or encrypted_content_fingerprint(child) in fingerprints
+            ):
+                changed = True
                 continue
-            new_child, child_changed = _strip_encrypted_content(child, depth + 1)
+            new_child, child_changed = _strip_encrypted_content(child, depth + 1, fingerprints)
             changed = changed or child_changed
             result[key] = new_child
         return result, changed
@@ -425,10 +436,11 @@ def _strip_encrypted_content(value: Any, depth: int = 0) -> Tuple[Any, bool]:
         for element in value:
             # Only an encrypted block is disposable. A surrounding text/media
             # block may carry both plaintext and a nested encrypted field.
-            if isinstance(element, dict) and element.get("type") == "encrypted_content":
+            if (isinstance(element, dict) and element.get("type") == "encrypted_content"
+                    and _contains_encrypted_content(element, depth + 1, fingerprints)):
                 changed = True
                 continue
-            new_element, element_changed = _strip_encrypted_content(element, depth + 1)
+            new_element, element_changed = _strip_encrypted_content(element, depth + 1, fingerprints)
             changed = changed or element_changed
             if element_changed and isinstance(new_element, dict) and not new_element:
                 continue
@@ -452,7 +464,7 @@ def _ensure_tool_output_present(item: Dict[str, Any]) -> Dict[str, Any]:
     return item
 
 
-def remove_encrypted_content_items(request_input: Any) -> Tuple[Any, int]:
+def remove_encrypted_content_items(request_input: Any, fingerprints=None) -> Tuple[Any, int]:
     """Strip encrypted content from Responses input, preserving tool-call pairing.
 
     Encrypted data appears either directly on a reasoning item or nested inside tool
@@ -464,7 +476,8 @@ def remove_encrypted_content_items(request_input: Any) -> Tuple[Any, int]:
     Reasoning and other encrypted item types are still removed outright. If a tool
     *call* itself has to go, its paired output is removed with it.
 
-    Returns the cleaned input and the number of items that were removed or rewritten.
+    Optional fingerprints limit cleanup to previously recovered ciphertext. New
+    encrypted blocks remain untouched. Returns input and changed item count.
     """
     if not isinstance(request_input, list):
         return request_input, 0
@@ -474,7 +487,7 @@ def remove_encrypted_content_items(request_input: Any) -> Tuple[Any, int]:
     dropped_call_ids = set()
 
     for item in request_input:
-        if not isinstance(item, dict) or not _contains_encrypted_content(item):
+        if not isinstance(item, dict) or not _contains_encrypted_content(item, fingerprints=fingerprints):
             cleaned_input.append(item)
             continue
 
@@ -482,7 +495,7 @@ def remove_encrypted_content_items(request_input: Any) -> Tuple[Any, int]:
         if item_type in ("message", "agent_message") or (
             item_type is None and "role" in item and "content" in item
         ):
-            sanitized, _ = _strip_encrypted_content(item)
+            sanitized, _ = _strip_encrypted_content(item, fingerprints=fingerprints)
             content = sanitized.get("content")
             if (isinstance(content, list) and content) or (
                 isinstance(content, str) and content.strip()
@@ -492,7 +505,7 @@ def remove_encrypted_content_items(request_input: Any) -> Tuple[Any, int]:
             continue
 
         if item_type in _TOOL_OUTPUT_ITEM_TYPES:
-            sanitized, _ = _strip_encrypted_content(item)
+            sanitized, _ = _strip_encrypted_content(item, fingerprints=fingerprints)
             cleaned_input.append(_ensure_tool_output_present(sanitized))
             changed_count += 1
             continue

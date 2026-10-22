@@ -252,11 +252,27 @@ form exactly once per request, before any model output has been forwarded:
   replay returns the HTTP-form rejection, recovery still runs on it.
 - Explicit invalid-request errors are not retried with the same input. Once text, reasoning,
   or tool-call output has been forwarded, the stream is never replayed.
+- After a cleaned request reaches `response.completed` (or a non-streaming response with
+  `status: completed`), the proxy remembers the removed ciphertext fingerprints for that
+  client thread. Later requests with the same `client_metadata.thread_id` preclean those
+  exact blocks before the first upstream call; newly introduced ciphertext is preserved.
+  This avoids repeatedly rejecting the same old encrypted history on every turn.
+- This memory is isolated by authenticated user, upstream URL, account type, model and
+  thread ID. It stores only hashes, expires after 24 hours, holds at most 8,192 scoped
+  fingerprints, and clears on proxy restart. Requests without an explicit thread ID keep
+  the ordinary one-request recovery behavior. Failed, incomplete or disconnected recovery
+  attempts never teach the cache. Disabling the recovery option also disables precleaning.
+- Request history includes an `encrypted_recovery` diagnostic: preclean count, whether
+  cleanup was attempted, completion, and bounded attempt stages. It distinguishes original
+  rejection, a cleaned stream being rejected again, and failure to establish recovery.
+  Diagnostics contain no ciphertext, plaintext, exception messages or credentials.
 
 The option is **off by default** because it is lossy — the model still loses encrypted
 reasoning/content, although surviving message text is preserved — and costs one extra
 upstream request. Cleanup changes only the forwarded request copy, not the original
 request history. Every recovery is counted (`mod.encrypted_content_removal`) and logged.
+Successful recoveries and subsequent precleaned requests also increment
+`mod.encrypted_content_recovery_completed` and `mod.encrypted_content_preclean`.
 
 This recovery covers the OpenAI-format endpoints, where ghc-api holds the reasoning state.
 It does **not** cover the Anthropic Messages compatibility path, where the state is carried
