@@ -89,6 +89,9 @@ class State:
         # (see remove_encrypted_content_items),
         # so it is opt-in.
         self.auto_remove_encrypted_content_on_parse_error: bool = False
+        # Restore proven declarations for encrypted function calls without
+        # enabling the opt-in removal of encrypted history above.
+        self.enable_portable_schema_recovery: bool = True
         self.save_request_to_file: bool = False
         self.disable_onedrive_access: bool = True
 

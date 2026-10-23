@@ -186,6 +186,9 @@ responses_pre_header_grace: 0.5 # How long a Responses request waits for upstrea
                               # the shortest client read timeout. Clamped to [0, 5]
                               # seconds; sse_keepalive_interval: 0 disables it entirely.
 
+# Restore proven encrypted tool declarations without deleting history
+enable_portable_schema_recovery: true # Independent of attachment cleanup below.
+
 # Recover from undecryptable encrypted content (disabled by default)
 auto_remove_encrypted_content_on_parse_error: false # If /v1/responses returns HTTP 400
                               # or an SSE error before any model output
@@ -245,7 +248,9 @@ form exactly once per request, before any model output has been forwarded:
 - The cleaned request is retried once; the retry does not consume the connection-retry budget,
   and a second identical failure is returned to the client as-is.
 - Streaming recovery reads the diagnostic that can follow `response.failed` with `error: null`.
-  It also handles a standalone `error` — in both the documented flat shape and the nested
+  The trailing read is bounded to one second, 64 lines and 64 KiB, and fills an empty
+  `response.failed.error` so clients can display the original reason. It also handles a
+  standalone `error` — in both the documented flat shape and the nested
   `error` object the live service sends — or an error inside `response.failed`. It works even
   when `enable_responses_early_failure_retry` is false or `max_connection_retries` is zero.
 - The two forms can interleave: when a diagnostic-free early failure is replayed and that
@@ -270,12 +275,14 @@ form exactly once per request, before any model output has been forwarded:
 Portable encrypted **function arguments** need a different repair. Codex compaction can
 omit the `additional_tools` declarations that identify encrypted parameters. For the
 exact upstream "original tool declaration or saved encryption schema" error, ghc-api
-never sends the arguments through the attachment-deletion path. With the same recovery
-option enabled, successful requests bind their exact tool declarations to hashes of the
+never sends the arguments through the attachment-deletion path. With
+`enable_portable_schema_recovery: true` (the default), successful requests bind their exact tool declarations to hashes of the
 qualified function name, call ID and argument bytes. A later compaction (identified by
 Codex request metadata) or explicit `tool_choice: none` request can restore only those
 proven declarations, with `tool_choice: none`; calls, arguments, results and plaintext
 remain unchanged. Declared tools cannot be executed during this repair.
+This setting operates independently of `auto_remove_encrypted_content_on_parse_error`,
+which can remain disabled while declaration recovery is enabled.
 
 This separate cache is scoped by user, upstream, account, model and explicit thread ID.
 It persists in `portable-schema-memory.json` under the configuration directory, contains
@@ -288,7 +295,7 @@ need a declaration independently verified against those calls. Request history e
 bounded `portable_schema_recovery` metadata. HTTP and SSE failures share the same
 one-attempt-per-repair policy, including when schema and attachment errors occur together.
 
-The option is **off by default** because it is lossy — the model still loses encrypted
+The attachment-cleanup option is **off by default** because it is lossy — the model still loses encrypted
 reasoning/content, although surviving message text is preserved — and costs one extra
 upstream request. Cleanup changes only the forwarded request copy, not the original
 request history. Every recovery is counted (`mod.encrypted_content_removal`) and logged.
@@ -300,6 +307,40 @@ It does **not** cover the Anthropic Messages compatibility path, where the state
 by the client: that path only retries a request byte-identically, so a rejected carrier is
 returned to the client with the upstream message and the conversation has to be restarted
 (or the offending `thinking` blocks dropped by the client).
+
+### Responses image limits and failure diagnostics
+
+The OpenAI Responses route recognizes images in message content and typed
+`function_call_output` / `custom_tool_call_output` results. These images enable
+the upstream vision header and count toward the 50-image request limit.
+Ordinary oversized requests receive an HTTP 400 with the image count before
+upstream submission. An already-running streaming compaction, identified by
+`X-Codex-Turn-Metadata.request_kind: compaction`, instead receives a terminal
+`response.failed` with `context_length_exceeded`, allowing Codex's compaction
+loop to trim its history and retry. The proxy leaves image content unchanged;
+ordinary over-limit errors do not automatically start compaction.
+
+Some upstream image rejections arrive as `response.failed` with no error detail
+even though a nonstreaming request returns a specific reason. Before replaying
+such a stream, the proxy can make one diagnostic request to the same upstream
+with the same model, images and history, `stream: false`, `tool_choice: none`
+and an output ceiling of 16 tokens. It runs only when no model output or
+specific error has been received. At most two diagnostic workers can run at
+once; the caller waits at most 10 seconds and the response body is limited to
+16 KiB. Diagnostic output is discarded and cannot teach recovery caches.
+
+Only the exact confirmed HTTP 400 image-policy rejection is accepted as an
+explanation for the original failure. The first failed event then carries that
+error. A 60-second, 128-entry in-memory cache lets an identical client retry
+receive the same HTTP 400 before streaming, without resubmitting the rejected
+input. Entries contain scoped request hashes and the fixed error, with isolation
+by user, upstream, account type, model and thread. Changed requests miss the
+cache. Request history exposes bounded `failure_diagnostic` metadata, and a
+cache hit includes `X-GHC-Error-Memo: hit`. The upstream policy decision is
+preserved; images and model selection are unchanged.
+
+Upstream HTTP errors arriving after downstream SSE headers have been sent also
+retain their original error code, message and parameter in the terminal event.
 
 ### Anthropic Messages Compatibility Reporting
 

@@ -187,6 +187,13 @@ responses_pre_header_grace: 0.5
 # Later requests preclean only those old blocks; new encrypted content is preserved.
 auto_remove_encrypted_content_on_parse_error: false
 
+# Restore proven original tool declarations for encrypted function calls during
+# compaction or other requests that disable tool use. Exact call/schema bindings
+# are learned only from completed responses and remain scoped to the original
+# user, upstream, account type, model, and explicit client_metadata.thread_id.
+# This preserves encrypted history and is independent of the lossy cleanup above.
+enable_portable_schema_recovery: true
+
 # If true, each completed request is appended to requests/YYYY-MM-DD.jl in the ghc-api config folder.
 save_request_to_file: false
 
