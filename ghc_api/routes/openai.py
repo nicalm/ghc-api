@@ -34,6 +34,10 @@ from ..sse.keepalive import (
     wait_result_with_keepalive,
 )
 from ..state import state
+from ..responses_image_guard import has_input_images, image_limit_error, image_limit_compaction_sse
+from ..responses_failure_diagnostics import (
+    permanent_rejections, probe_image_failure, rejection_memo_key,
+)
 from ..streaming import reconstruct_openai_response_from_chunks
 from ..translator import translate_model_name
 from ..utils import (
@@ -61,7 +65,11 @@ class _RecoveryStreamHandler(OpenAIResponsesStreamHandler):
                 self.recovery.complete(event.get("response"))
 
     def extra_cache_fields(self):
-        return self.recovery.cache_fields() if self.recovery is not None else {}
+        fields = self.recovery.cache_fields() if self.recovery is not None else {}
+        diagnostic_fields = getattr(self.response, "error_diagnostic_fields", None)
+        if callable(diagnostic_fields):
+            fields.update(diagnostic_fields())
+        return fields
 
 
 def _current_user_id() -> str:
@@ -131,6 +139,29 @@ def _responses_error_event(
     return f"event: error\ndata: {json.dumps(event)}\n\n"
 
 
+def _responses_upstream_error_details(response_body, response_text, status_code):
+    """Preserve actionable error codes after downstream headers are committed."""
+    error = response_body
+    if isinstance(error, dict):
+        error = error.get("error", error)
+    if isinstance(error, dict):
+        message = error.get("message")
+        code = error.get("code") or error.get("type")
+        return (
+            message if isinstance(message, str) and message else (
+                response_text or f"Upstream returned HTTP {status_code}"
+            ),
+            code if isinstance(code, str) and code else "upstream_error",
+            error.get("param"),
+        )
+    return (
+        error if isinstance(error, str) and error else (
+            response_text or f"Upstream returned HTTP {status_code}"
+        ),
+        "upstream_error", None,
+    )
+
+
 def _complete_responses_stream_error(
     request_id: str,
     payload: Dict,
@@ -181,7 +212,32 @@ def _build_responses_stream_handler(
         state.auto_remove_encrypted_content_on_parse_error
         and (recovery is not None or not encrypted_content_retry_attempted)
     )
-    if (state.enable_responses_early_failure_retry or recover_encrypted_content
+    recover_portable_schema = (
+        recovery is not None and recovery.portable.enabled
+        and recovery.portable.scope is not None
+    )
+    recover_input = recover_encrypted_content or recover_portable_schema
+    error_diagnostic_factory = None
+    on_error_diagnostic = None
+    if has_input_images(payload):
+        # Hash the immutable original body here and in the preflight lookup;
+        # schema recovery/model translation can change the forwarded payload.
+        upstream = get_copilot_base_url()
+        memo_key = rejection_memo_key(
+            original_request_body, user_id, upstream, state.account_type,
+            translated_model, request_headers,
+        )
+
+        def diagnose_image_error():
+            return probe_image_failure(
+                payload, get_copilot_headers(enable_vision),
+                f"{upstream}/v1/responses",
+            )
+
+        error_diagnostic_factory = diagnose_image_error
+        on_error_diagnostic = lambda body: permanent_rejections.put(memo_key, body)
+    if (state.enable_responses_early_failure_retry or recover_input
+            or error_diagnostic_factory is not None
             or (recovery is not None and recovery.has_attempted)):
         def retry_streaming_response():
             ensure_copilot_token()
@@ -224,9 +280,11 @@ def _build_responses_stream_handler(
             response_factory=retry_streaming_response,
             max_retries=state.max_connection_retries if state.enable_responses_early_failure_retry else 0,
             request_id=request_id,
-            error_response_factory=retry_encrypted_content if recover_encrypted_content else None,
+            error_response_factory=retry_encrypted_content if recover_input else None,
             on_diagnostic=recovery.diagnostic if recovery is not None else None,
             initial_after_recovery=recovery.has_attempted if recovery is not None else encrypted_content_retry_attempted,
+            error_diagnostic_factory=error_diagnostic_factory,
+            on_error_diagnostic=on_error_diagnostic,
         )
 
     handler = _RecoveryStreamHandler(
@@ -363,14 +421,15 @@ def _stream_pending_responses_request(
                     "/v1/responses", active_payload, response_text,
                     response.status_code, client_ip,
                 )
-                if state.auto_remove_encrypted_content_on_parse_error:
+                if recovery is not None or state.auto_remove_encrypted_content_on_parse_error:
                     removed_count = 0
                     if recovery is not None:
                         retry_payload, removed_count = recovery.recover_http_error(
                             active_payload, response.status_code, response_text,
                         )
                         encrypted_content_retry_attempted = recovery.attempted
-                    elif (not encrypted_content_retry_attempted
+                    elif (state.auto_remove_encrypted_content_on_parse_error
+                          and not encrypted_content_retry_attempted
                           and is_encrypted_content_parse_error(response.status_code, response_text)):
                         encrypted_content_retry_attempted = True
                         request_input = active_payload.get("input")
@@ -396,14 +455,16 @@ def _stream_pending_responses_request(
                     response_body = response_text
                 if recovery is not None and recovery.has_attempted:
                     recovery.diagnostic({"stage": "recovery_http_error", "status_code": response.status_code})
-                message = response_text or f"Upstream returned HTTP {response.status_code}"
+                message, code, param = _responses_upstream_error_details(
+                    response_body, response_text, response.status_code,
+                )
                 _complete_responses_stream_error(
                     request_id, active_payload, response_body, response.status_code,
                     active_request_size, start_time, original_model, translated_model,
                     user_id,
                     recovery=recovery,
                 )
-                yield _responses_error_event(message)
+                yield _responses_error_event(message, code, param)
                 return
 
         except GeneratorExit:
@@ -1785,20 +1846,59 @@ def responses():
                 }
             }), 400
 
-        # Check for vision content in input
-        enable_vision = False
-        input_content = payload.get("input")
-        if isinstance(input_content, list):
-            for item in input_content:
-                if isinstance(item, dict):
-                    content = item.get("content")
-                    if isinstance(content, list):
-                        if any(p.get("type") == "input_image" for p in content):
-                            enable_vision = True
-                            break
-                    elif item.get("type") == "input_image":
-                        enable_vision = True
-                        break
+        # A prior diagnostic confirmed this exact original image request was
+        # rejected. Return its real 400 before SSE, without submitting it again.
+        if has_input_images(original_request_body):
+            memo_key = rejection_memo_key(
+                original_request_body, user_id, get_copilot_base_url(),
+                state.account_type, translated_model, request_headers,
+            )
+            memo_error = permanent_rejections.get(memo_key)
+            if memo_error is not None:
+                cache.add_request(request_id, {
+                    "request_headers": request_headers, "client_ip": client_ip,
+                    "original_request_body": original_request_body,
+                    "request_body": payload, "response_body": memo_error,
+                    "model": original_model,
+                    "translated_model": translated_model if translated_model != original_model else None,
+                    "endpoint": "/v1/responses", "status_code": 400,
+                    "request_size": len(json.dumps(payload)),
+                    "response_size": len(json.dumps(memo_error)),
+                    "duration": round(time.time() - start_time, 2), "user_id": user_id,
+                    "failure_diagnostic": {
+                        "eligible": True, "attempts": 0, "outcome": "memo_hit",
+                        "status_code": 400, "memo_hit": True,
+                    },
+                })
+                result = jsonify(memo_error)
+                result.headers["X-GHC-Error-Memo"] = "hit"
+                return result, 400
+
+        # Keep ordinary image-count errors explicit. Only an already-running
+        # compaction needs the terminal SSE code to shrink its input history.
+        limit_error = image_limit_error(payload)
+        if limit_error is not None:
+            cache.add_request(request_id, {
+                "request_headers": request_headers, "client_ip": client_ip,
+                "original_request_body": original_request_body,
+                "request_body": payload, "response_body": limit_error,
+                "model": original_model,
+                "translated_model": translated_model if translated_model != original_model else None,
+                "endpoint": "/v1/responses", "status_code": 400,
+                "request_size": len(json.dumps(payload)),
+                "response_size": len(json.dumps(limit_error)),
+                "duration": round(time.time() - start_time, 2), "user_id": user_id,
+            })
+            compaction_error = image_limit_compaction_sse(
+                payload, limit_error,
+                request.headers.get("X-Codex-Turn-Metadata"), request_id,
+            )
+            if compaction_error is not None:
+                return Response(compaction_error, mimetype="text/event-stream", headers={
+                    "Cache-Control": "no-cache", "X-Accel-Buffering": "no",
+                })
+            return jsonify(limit_error), 400
+        enable_vision = has_input_images(payload)
 
         headers = get_copilot_headers(enable_vision)
 
@@ -1814,6 +1914,7 @@ def responses():
             payload, user_id, get_copilot_base_url(), state.account_type,
             state.auto_remove_encrypted_content_on_parse_error,
             request_kind=request_kind,
+            portable_enabled=state.enable_portable_schema_recovery,
         )
         payload = recovery.prepare(payload)
 
@@ -1904,7 +2005,7 @@ def responses():
                 if not response.ok:
                     print(f"Received error response for request {request_id}: {response.status_code} - {response.text}")
                     log_error_request("/v1/responses", payload, response.text, response.status_code, client_ip)
-                    if state.auto_remove_encrypted_content_on_parse_error:
+                    if recovery is not None:
                         retry_payload, removed_count = recovery.recover_http_error(
                             payload, response.status_code, response.text,
                         )

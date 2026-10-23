@@ -1,4 +1,4 @@
-"""Recovery diagnostics describe attempts without changing the Responses wire."""
+"""Recovery preserves wire except explicit failed.error enrichment from its tail."""
 
 import json
 import threading
@@ -101,10 +101,15 @@ def test_completion_after_output_is_reported_without_recovery():
 
 
 @pytest.mark.parametrize("failure", [requests.ConnectionError("SECRET_TOKEN"), RuntimeError("SECRET_TOKEN")])
-def test_recovery_creation_exception_retains_original_wire_without_leaking_message(failure, capsys):
+def test_recovery_creation_exception_only_enriches_failed_error_without_leaking_message(failure, capsys):
     diagnostics = []
     lines = rejected_lines()
-    assert list(wrapper(FakeResponse(lines), diagnostics, mock.Mock(side_effect=failure)).iter_lines()) == lines
+    expected = list(lines)
+    expected[2] = event("response.failed", response={"error": ENCRYPTED_ERROR})
+    recover, retry = mock.Mock(side_effect=failure), mock.Mock()
+    assert list(wrapper(FakeResponse(lines), diagnostics, recover, 3, retry).iter_lines()) == expected
+    recover.assert_called_once_with(ENCRYPTED_ERROR)
+    retry.assert_not_called()
     assert diagnostics == [
         {"stage": "original_rejected", "error_code": "invalid_request_body"},
         {"stage": "recovery_started"},
@@ -114,11 +119,16 @@ def test_recovery_creation_exception_retains_original_wire_without_leaking_messa
     assert "SECRET_TOKEN" not in capsys.readouterr().out
 
 
-def test_recovery_http_failure_reports_status_and_retains_original_wire():
+def test_recovery_http_failure_reports_status_and_only_enriches_failed_error():
     lines = rejected_lines()
+    expected = list(lines)
+    expected[2] = event("response.failed", response={"error": ENCRYPTED_ERROR})
     diagnostics = []
     failed = FakeResponse(status_code=503, body={"error": {"message": "SECRET"}})
-    assert list(wrapper(FakeResponse(lines), diagnostics, mock.Mock(return_value=failed)).iter_lines()) == lines
+    recover, retry = mock.Mock(return_value=failed), mock.Mock()
+    assert list(wrapper(FakeResponse(lines), diagnostics, recover, 3, retry).iter_lines()) == expected
+    recover.assert_called_once_with(ENCRYPTED_ERROR)
+    retry.assert_not_called()
     assert failed.closed
     assert diagnostics[-1] == {"stage": "recovery_http_error", "status_code": 503}
     assert not any(item["stage"] == "completed" for item in diagnostics)
@@ -183,8 +193,14 @@ def test_http_first_recovery_can_mark_initial_stream_as_recovered():
 def test_declined_recovery_is_not_reported_as_started():
     diagnostics = []
     lines = rejected_lines()
-    assert list(wrapper(FakeResponse(lines), diagnostics, mock.Mock(return_value=None)).iter_lines()) == lines
+    expected = list(lines)
+    expected[2] = event("response.failed", response={"error": ENCRYPTED_ERROR})
+    recover, retry = mock.Mock(return_value=None), mock.Mock()
+    assert list(wrapper(FakeResponse(lines), diagnostics, recover, 3, retry).iter_lines()) == expected
+    recover.assert_called_once_with(ENCRYPTED_ERROR)
+    retry.assert_not_called()
     assert diagnostics == [{"stage": "original_rejected", "error_code": "invalid_request_body"}]
+    assert "SECRET" not in json.dumps(diagnostics)
 
 
 @pytest.mark.parametrize("error", [None, {}])
@@ -192,8 +208,14 @@ def test_recovered_failure_uses_trailing_error_code_or_reports_unknown(error):
     for trailing in ([], [event("error", error={"code": "upstream_error", "message": "SECRET"})]):
         diagnostics = []
         lines = [event("response.failed", response={"error": error}), *trailing, b"data: [DONE]"]
-        assert list(wrapper(FakeResponse(lines), diagnostics, initial_after_recovery=True).iter_lines()) == lines
+        expected = list(lines)
+        if trailing:
+            expected[0] = event("response.failed", response={"error": {"code": "upstream_error", "message": "SECRET"}})
+        retry = mock.Mock()
+        assert list(wrapper(FakeResponse(lines), diagnostics, factory=retry, initial_after_recovery=True).iter_lines()) == expected
+        retry.assert_not_called()
         assert diagnostics == [{"stage": "recovery_rejected", "error_code": "upstream_error" if trailing else "unknown"}]
+        assert "SECRET" not in json.dumps(diagnostics)
 
 
 def test_error_code_is_bounded_metadata_and_cannot_include_payload_object():

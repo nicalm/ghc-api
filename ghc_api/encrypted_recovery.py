@@ -74,10 +74,15 @@ recovery_memory = RecoveryMemory()
 
 class EncryptionRecovery:
     """One request's preclean/recovery transaction and redacted diagnostics."""
-    def __init__(self, payload, user_id, upstream, account_type, enabled, request_kind=None):
+    def __init__(self, payload, user_id, upstream, account_type, enabled, request_kind=None,
+                 portable_enabled=None):
         self.enabled = enabled
+        # Preserve existing callers while allowing declaration recovery without
+        # opting into removal of encrypted reasoning or tool output content.
+        if portable_enabled is None:
+            portable_enabled = enabled
         self.portable = PortableSchemaRecovery(
-            payload, user_id, upstream, account_type, enabled, request_kind=request_kind,
+            payload, user_id, upstream, account_type, portable_enabled, request_kind=request_kind,
         )
         metadata = payload.get("client_metadata") or {}
         thread = metadata.get("thread_id") if isinstance(metadata, dict) else None
@@ -121,6 +126,8 @@ class EncryptionRecovery:
         return payload
 
     def recover(self, payload):
+        if not self.enabled:
+            return payload, 0
         cleaned, count = remove_encrypted_content_items(payload.get("input"))
         if count:
             self.attempted = True
@@ -138,10 +145,11 @@ class EncryptionRecovery:
 
     def recover_error(self, payload, error):
         """Different failures need different repairs; schema loss never deletes history."""
+        if is_portable_schema_error(error):
+            return (self.portable.recover(payload, error) if self.portable.enabled
+                    else (payload, 0))
         if not self.enabled:
             return payload, 0
-        if is_portable_schema_error(error):
-            return self.portable.recover(payload, error)
         if not self.attempted and is_encrypted_content_error(error):
             return self.recover(payload)
         return payload, 0

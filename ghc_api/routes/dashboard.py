@@ -66,6 +66,7 @@ def _runtime_config() -> Dict[str, Any]:
         "upstream_read_timeout": state.upstream_read_timeout,
         "sse_keepalive_interval": state.sse_keepalive_interval,
         "auto_remove_encrypted_content_on_parse_error": state.auto_remove_encrypted_content_on_parse_error,
+        "enable_portable_schema_recovery": state.enable_portable_schema_recovery,
         "save_request_to_file": state.save_request_to_file,
         "log_webiq_requests": state.log_webiq_requests,
         "disable_onedrive_access": state.disable_onedrive_access,
@@ -221,6 +222,7 @@ def api_runtime_config_update():
         "upstream_read_timeout",
         "sse_keepalive_interval",
         "auto_remove_encrypted_content_on_parse_error",
+        "enable_portable_schema_recovery",
         "save_request_to_file",
         "log_webiq_requests",
         "disable_onedrive_access",
@@ -288,6 +290,12 @@ def api_runtime_config_update():
             if not isinstance(flag, bool):
                 raise ValueError("'auto_remove_encrypted_content_on_parse_error' must be a boolean")
             state.auto_remove_encrypted_content_on_parse_error = flag
+
+        if "enable_portable_schema_recovery" in payload:
+            flag = payload["enable_portable_schema_recovery"]
+            if not isinstance(flag, bool):
+                raise ValueError("'enable_portable_schema_recovery' must be a boolean")
+            state.enable_portable_schema_recovery = flag
 
         if "save_request_to_file" in payload:
             save_req = payload["save_request_to_file"]

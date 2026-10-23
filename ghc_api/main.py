@@ -295,6 +295,9 @@ def main():
                 max(0.0, float(config['responses_pre_header_grace'])), 5.0)
         if 'auto_remove_encrypted_content_on_parse_error' in config:
             state.auto_remove_encrypted_content_on_parse_error = bool(config['auto_remove_encrypted_content_on_parse_error'])
+        if 'enable_portable_schema_recovery' in config:
+            state.enable_portable_schema_recovery = _config_bool(
+                config['enable_portable_schema_recovery'], 'enable_portable_schema_recovery')
         if 'save_request_to_file' in config:
             state.save_request_to_file = bool(config['save_request_to_file'])
         if 'disable_onedrive_access' in config:
