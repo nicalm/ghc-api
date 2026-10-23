@@ -267,6 +267,27 @@ form exactly once per request, before any model output has been forwarded:
   rejection, a cleaned stream being rejected again, and failure to establish recovery.
   Diagnostics contain no ciphertext, plaintext, exception messages or credentials.
 
+Portable encrypted **function arguments** need a different repair. Codex compaction can
+omit the `additional_tools` declarations that identify encrypted parameters. For the
+exact upstream "original tool declaration or saved encryption schema" error, ghc-api
+never sends the arguments through the attachment-deletion path. With the same recovery
+option enabled, successful requests bind their exact tool declarations to hashes of the
+qualified function name, call ID and argument bytes. A later compaction (identified by
+Codex request metadata) or explicit `tool_choice: none` request can restore only those
+proven declarations, with `tool_choice: none`; calls, arguments, results and plaintext
+remain unchanged. Declared tools cannot be executed during this repair.
+
+This separate cache is scoped by user, upstream, account, model and explicit thread ID.
+It persists in `portable-schema-memory.json` under the configuration directory, contains
+declarations and hashes rather than call bodies, expires after 24 hours, and is bounded
+to 8,192 bindings and 8 MiB. New or changed argument bytes are not matched. Conflicting
+schema versions or missing bindings are left unrepaired instead of guessed. The cache
+is populated only after successful completion, before dashboard body truncation matters.
+It cannot reconstruct an older declaration that the proxy never observed; such histories
+need a declaration independently verified against those calls. Request history exposes
+bounded `portable_schema_recovery` metadata. HTTP and SSE failures share the same
+one-attempt-per-repair policy, including when schema and attachment errors occur together.
+
 The option is **off by default** because it is lossy — the model still loses encrypted
 reasoning/content, although surviving message text is preserved — and costs one extra
 upstream request. Cleanup changes only the forwarded request copy, not the original

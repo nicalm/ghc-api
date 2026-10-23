@@ -58,7 +58,7 @@ class _RecoveryStreamHandler(OpenAIResponsesStreamHandler):
         super().on_event(event_type, event)
         if self.recovery is not None:
             if event_type == "response.completed" and not self.error_occurred:
-                self.recovery.complete()
+                self.recovery.complete(event.get("response"))
 
     def extra_cache_fields(self):
         return self.recovery.cache_fields() if self.recovery is not None else {}
@@ -179,10 +179,10 @@ def _build_responses_stream_handler(
     upstream_response = response
     recover_encrypted_content = (
         state.auto_remove_encrypted_content_on_parse_error
-        and not encrypted_content_retry_attempted
+        and (recovery is not None or not encrypted_content_retry_attempted)
     )
     if (state.enable_responses_early_failure_retry or recover_encrypted_content
-            or (recovery is not None and recovery.attempted)):
+            or (recovery is not None and recovery.has_attempted)):
         def retry_streaming_response():
             ensure_copilot_token()
             retry_headers = get_copilot_headers(enable_vision)
@@ -196,17 +196,17 @@ def _build_responses_stream_handler(
 
         def retry_encrypted_content(error):
             nonlocal payload, encrypted_content_retry_attempted
-            if encrypted_content_retry_attempted or not is_encrypted_content_error(error):
-                return None
             if recovery is not None:
-                retry_payload, removed_count = recovery.recover(payload)
+                retry_payload, removed_count = recovery.recover_error(payload, error)
             else:
+                if encrypted_content_retry_attempted or not is_encrypted_content_error(error):
+                    return None
                 cleaned_input, removed_count = remove_encrypted_content_items(payload.get("input"))
                 retry_payload = {**payload, "input": cleaned_input}
             if not removed_count:
                 return None
 
-            encrypted_content_retry_attempted = True
+            encrypted_content_retry_attempted = recovery.attempted if recovery is not None else True
             payload = retry_payload
             handler.request_body_for_cache = payload
             handler.request_size = len(json.dumps(payload))
@@ -214,12 +214,9 @@ def _build_responses_stream_handler(
                 request_id, cache.STATE_SENDING,
                 request_body=payload, request_size=handler.request_size,
             )
-            counters.incr("mod.encrypted_content_removal")
-            print(
-                f"[Stream Responses] Retrying request {request_id} after removing "
-                f"encrypted content from {removed_count} input items; "
-                "encrypted context is lost."
-            )
+            if is_encrypted_content_error(error):
+                counters.incr("mod.encrypted_content_removal")
+            print(f"[Stream Responses] Retrying request {request_id} after encryption recovery ({removed_count} items).")
             return retry_streaming_response()
 
         upstream_response = RetryingResponsesResponse(
@@ -229,7 +226,7 @@ def _build_responses_stream_handler(
             request_id=request_id,
             error_response_factory=retry_encrypted_content if recover_encrypted_content else None,
             on_diagnostic=recovery.diagnostic if recovery is not None else None,
-            initial_after_recovery=encrypted_content_retry_attempted,
+            initial_after_recovery=recovery.has_attempted if recovery is not None else encrypted_content_retry_attempted,
         )
 
     handler = _RecoveryStreamHandler(
@@ -335,7 +332,7 @@ def _stream_pending_responses_request(
                         f"Upstream connection error after {connection_retries + 1} "
                         f"attempts: {type(exc).__name__}"
                     )
-                    if recovery is not None and recovery.attempted:
+                    if recovery is not None and recovery.has_attempted:
                         recovery.diagnostic({"stage": "recovery_exception", "error_type": type(exc).__name__})
                     body = {"error": message}
                     _complete_responses_stream_error(
@@ -366,38 +363,38 @@ def _stream_pending_responses_request(
                     "/v1/responses", active_payload, response_text,
                     response.status_code, client_ip,
                 )
-                if (
-                    state.auto_remove_encrypted_content_on_parse_error
-                    and not encrypted_content_retry_attempted
-                    and is_encrypted_content_parse_error(response.status_code, response_text)
-                ):
-                    encrypted_content_retry_attempted = True
-                    request_input = active_payload.get("input")
-                    if isinstance(request_input, list):
-                        if recovery is not None:
-                            retry_payload, removed_count = recovery.recover(active_payload)
-                        else:
+                if state.auto_remove_encrypted_content_on_parse_error:
+                    removed_count = 0
+                    if recovery is not None:
+                        retry_payload, removed_count = recovery.recover_http_error(
+                            active_payload, response.status_code, response_text,
+                        )
+                        encrypted_content_retry_attempted = recovery.attempted
+                    elif (not encrypted_content_retry_attempted
+                          and is_encrypted_content_parse_error(response.status_code, response_text)):
+                        encrypted_content_retry_attempted = True
+                        request_input = active_payload.get("input")
+                        if isinstance(request_input, list):
                             cleaned_input, removed_count = remove_encrypted_content_items(request_input)
                             retry_payload = {**active_payload, "input": cleaned_input}
-                        if removed_count > 0:
+                    if removed_count > 0:
+                        if is_encrypted_content_parse_error(response.status_code, response_text):
                             counters.incr("mod.encrypted_content_removal")
-                            active_payload = retry_payload
-                            active_request_size = len(json.dumps(active_payload))
-                            cache.update_request_state(
-                                request_id,
-                                cache.STATE_SENDING,
-                                request_body=active_payload,
-                                request_size=active_request_size,
-                            )
-                            response = None
-                            active_pending = None
-                            continue
+                        active_payload = retry_payload
+                        active_request_size = len(json.dumps(active_payload))
+                        cache.update_request_state(
+                            request_id, cache.STATE_SENDING,
+                            request_body=active_payload, request_size=active_request_size,
+                        )
+                        response = None
+                        active_pending = None
+                        continue
 
                 try:
                     response_body = response.json()
                 except Exception:
                     response_body = response_text
-                if recovery is not None and recovery.attempted:
+                if recovery is not None and recovery.has_attempted:
                     recovery.diagnostic({"stage": "recovery_http_error", "status_code": response.status_code})
                 message = response_text or f"Upstream returned HTTP {response.status_code}"
                 _complete_responses_stream_error(
@@ -1808,9 +1805,15 @@ def responses():
         _normalize_responses_tool_descriptions(payload)
         _filter_responses_web_search_tools(payload, translated_model, request_id)
 
+        try:
+            turn_metadata = json.loads(request.headers.get("X-Codex-Turn-Metadata", "{}"))
+        except (TypeError, ValueError):
+            turn_metadata = {}
+        request_kind = turn_metadata.get("request_kind") if isinstance(turn_metadata, dict) else None
         recovery = EncryptionRecovery(
             payload, user_id, get_copilot_base_url(), state.account_type,
             state.auto_remove_encrypted_content_on_parse_error,
+            request_kind=request_kind,
         )
         payload = recovery.prepare(payload)
 
@@ -1901,25 +1904,18 @@ def responses():
                 if not response.ok:
                     print(f"Received error response for request {request_id}: {response.status_code} - {response.text}")
                     log_error_request("/v1/responses", payload, response.text, response.status_code, client_ip)
-                    if (
-                        state.auto_remove_encrypted_content_on_parse_error
-                        and not encrypted_content_retry_attempted
-                        and is_encrypted_content_parse_error(response.status_code, response.text)
-                    ):
-                        encrypted_content_retry_attempted = True
-                        request_input = payload.get("input")
-                        if isinstance(request_input, list):
-                            retry_payload, removed_count = recovery.recover(payload)
-                            print("Warning: Detected possible encrypted content parse error in response. auto_remove_encrypted_content_on_parse_error is enabled, so will remove encrypted content and retry the request. May cause loss of information.")
-                            print("Try to remove encrypted content and retry", f"Cleaned {removed_count} encrypted content items from input for request {request_id}")
-                            if removed_count > 0:
+                    if state.auto_remove_encrypted_content_on_parse_error:
+                        retry_payload, removed_count = recovery.recover_http_error(
+                            payload, response.status_code, response.text,
+                        )
+                        encrypted_content_retry_attempted = recovery.attempted
+                        if removed_count > 0:
+                            if is_encrypted_content_parse_error(response.status_code, response.text):
                                 counters.incr("mod.encrypted_content_removal")
-                                payload = retry_payload
-                                # The error body was already consumed; release the
-                                # upstream connection before issuing the retry.
-                                response.close()
-                                response = None
-                                continue
+                            payload = retry_payload
+                            response.close()
+                            response = None
+                            continue
                 last_connection_error = None
                 break
             except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectionError) as e:
@@ -1938,7 +1934,7 @@ def responses():
 
         if last_connection_error is not None:
             message = f"Upstream connection error after {connection_retries + 1} attempts: {type(last_connection_error).__name__}"
-            if recovery.attempted:
+            if recovery.has_attempted:
                 recovery.diagnostic({"stage": "recovery_exception", "error_type": type(last_connection_error).__name__})
                 cache.start_request(request_id, {
                     "request_headers": request_headers, "client_ip": client_ip,
@@ -1960,7 +1956,7 @@ def responses():
         if response.ok:
             result = response.json()
             if result.get("status") == "completed":
-                recovery.complete()
+                recovery.complete(result)
 
             usage = result.get("usage", {})
             cache.add_request(request_id, {
@@ -1985,7 +1981,7 @@ def responses():
 
             return jsonify(result)
         else:
-            if recovery.attempted:
+            if recovery.has_attempted:
                 recovery.diagnostic({"stage": "recovery_http_error", "status_code": response.status_code})
             log_error_request("/v1/responses", payload, response.text, response.status_code, client_ip)
             usage = {}

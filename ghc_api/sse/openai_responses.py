@@ -179,7 +179,7 @@ class RetryingResponsesResponse:
         body here would leave recovery unattempted and send the client the
         earlier, diagnostic-free ``response.failed`` instead.
         """
-        if self._error_response_factory is None:
+        if self._error_response_factory is None or response.status_code != 400:
             return None
         try:
             error = response.json().get("error")
@@ -338,17 +338,24 @@ class RetryingResponsesResponse:
                     )
                     retry_response = None
 
-                if retry_response is not None and not retry_response.ok:
-                    if after_recovery:
-                        self._diagnostic("recovery_http_error", status_code=retry_response.status_code)
-                    recovered = self._recover_from_http_error(retry_response, after_recovery)
-                    if recovered is not None:
-                        retry_response.close()
-                        retry_response = recovered
-                        # Recovery has its own one-shot budget; this attempt
-                        # must not be charged to the connection retries.
-                        generic_retry = False
-                        recovery_response = True
+            # Schema restoration and attachment cleanup are distinct, bounded
+            # repairs. Either repair can reveal the other error in HTTP form.
+            # Offer both forms to the same factory without generic replay or
+            # recursion; the factory also enforces one attempt per repair.
+            for _ in range(2):
+                if retry_response is None or retry_response.ok:
+                    break
+                if after_recovery or recovery_response:
+                    self._diagnostic("recovery_http_error", status_code=retry_response.status_code)
+                recovered = self._recover_from_http_error(
+                    retry_response, after_recovery or recovery_response,
+                )
+                if recovered is None:
+                    break
+                retry_response.close()
+                retry_response = recovered
+                generic_retry = False
+                recovery_response = True
 
             if retry_response is not None and retry_response.ok:
                 if not self._replace_response(response, retry_response):

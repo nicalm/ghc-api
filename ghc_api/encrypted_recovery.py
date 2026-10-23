@@ -7,6 +7,8 @@ from collections import OrderedDict
 
 from .counters import counters
 from .utils import encrypted_content_fingerprint, remove_encrypted_content_items
+from .utils import is_encrypted_content_error
+from .portable_schema import PortableSchemaRecovery, is_portable_schema_error
 
 
 def _fingerprints(value, depth=0):
@@ -72,8 +74,11 @@ recovery_memory = RecoveryMemory()
 
 class EncryptionRecovery:
     """One request's preclean/recovery transaction and redacted diagnostics."""
-    def __init__(self, payload, user_id, upstream, account_type, enabled):
+    def __init__(self, payload, user_id, upstream, account_type, enabled, request_kind=None):
         self.enabled = enabled
+        self.portable = PortableSchemaRecovery(
+            payload, user_id, upstream, account_type, enabled, request_kind=request_kind,
+        )
         metadata = payload.get("client_metadata") or {}
         thread = metadata.get("thread_id") if isinstance(metadata, dict) else None
         # A provider cache key alone need not be a session identifier. Without a
@@ -89,6 +94,7 @@ class EncryptionRecovery:
         self.events = []
 
     def diagnostic(self, event):
+        self.portable.diagnostic(event)
         # The stream handler commits completion only after consuming the event;
         # the wrapper also observes it, but must not learn speculatively.
         if event.get("stage") == "completed":
@@ -100,6 +106,7 @@ class EncryptionRecovery:
                                 if k in {"stage", "error_type", "status_code", "error_code", "after_recovery"}})
 
     def prepare(self, payload):
+        payload = self.portable.prepare(payload)
         known = recovery_memory.lookup(self.scope) if self.enabled else set()
         if not known:
             return payload
@@ -108,7 +115,9 @@ class EncryptionRecovery:
             self.precleaned_items = count
             self.diagnostic({"stage": "precleaned"})
             counters.incr("mod.encrypted_content_preclean")
-            return {**payload, "input": cleaned}
+            payload = {**payload, "input": cleaned}
+            self.portable.track_payload(payload)
+            return payload
         return payload
 
     def recover(self, payload):
@@ -119,11 +128,37 @@ class EncryptionRecovery:
             if not any(event.get("stage") == "original_rejected" for event in self.events):
                 self.diagnostic({"stage": "original_rejected"})
             self.diagnostic({"stage": "cleanup_applied"})
-        return {**payload, "input": cleaned}, count
+        result = {**payload, "input": cleaned}
+        self.portable.track_payload(result)
+        return result, count
 
-    def complete(self):
+    @property
+    def has_attempted(self):
+        return self.attempted or self.portable.attempted
+
+    def recover_error(self, payload, error):
+        """Different failures need different repairs; schema loss never deletes history."""
+        if not self.enabled:
+            return payload, 0
+        if is_portable_schema_error(error):
+            return self.portable.recover(payload, error)
+        if not self.attempted and is_encrypted_content_error(error):
+            return self.recover(payload)
+        return payload, 0
+
+    def recover_http_error(self, payload, status_code, response_text):
+        if status_code != 400:
+            return payload, 0
+        try:
+            error = json.loads(response_text).get("error")
+        except (ValueError, AttributeError, TypeError):
+            return payload, 0
+        return self.recover_error(payload, error)
+
+    def complete(self, response=None):
         if self.completed:
             return
+        self.portable.complete(response)
         self.completed = True
         if self.enabled and self.pending:
             recovery_memory.remember(self.scope, self.pending)
@@ -132,7 +167,7 @@ class EncryptionRecovery:
             self.events.append({"stage": "completed", "after_recovery": self.attempted})
 
     def cache_fields(self):
-        return {"encrypted_recovery": {
+        return {**self.portable.cache_fields(), "encrypted_recovery": {
             "precleaned_items": self.precleaned_items, "attempted": self.attempted,
             "completed": self.completed, "events": list(self.events),
         }}
