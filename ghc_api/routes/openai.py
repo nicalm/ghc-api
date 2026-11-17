@@ -1825,7 +1825,13 @@ def responses():
         conn_attempt = 0
         encrypted_content_retry_attempted = False
 
-        if use_streaming and state.sse_keepalive_interval > 0:
+        # Native Codex interprets usage using upstream response headers. A
+        # speculative pre-header keepalive would irrevocably drop that metadata.
+        # Wait for the actual headers for these requests; SSE body keepalives,
+        # existing upstream timeouts and HTTP/stream recovery remain enabled.
+        # Other clients keep their existing pre-response keepalive behavior.
+        needs_accounting_headers = "X-Codex-Turn-Metadata" in request.headers
+        if use_streaming and state.sse_keepalive_interval > 0 and not needs_accounting_headers:
             request_size = len(json.dumps(payload))
             pending_response = _start_responses_post(headers, payload)
             # Preserve the old direct-handler path for responses that are

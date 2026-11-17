@@ -173,6 +173,10 @@ class SSEStreamHandler:
         """Extra keys for ``cache.complete_request``. Default: none."""
         return {}
 
+    def extra_response_headers(self) -> Dict[str, str]:
+        """Protocol-specific, allowlisted metadata. Default: forward nothing."""
+        return {}
+
     def raw_events_for_cache(self) -> List[str]:
         """Dashboard projection of captured data payloads."""
 
@@ -252,13 +256,15 @@ class SSEStreamHandler:
         handlers' behavior.
         """
         self._seed_cache()
+        headers = {
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        }
+        headers.update(self.extra_response_headers())
         return Response(
             stream_with_context(self._generate()),
             mimetype="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "X-Accel-Buffering": "no",
-            },
+            headers=headers,
         )
 
     def _generate(self) -> Generator[str, None, None]:

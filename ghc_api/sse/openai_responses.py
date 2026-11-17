@@ -15,6 +15,7 @@ import requests
 
 from ..utils import is_encrypted_content_error
 from .base import SSEStreamHandler
+from .response_headers import reasoning_accounting_headers
 
 
 class RetryingResponsesResponse:
@@ -73,6 +74,7 @@ class RetryingResponsesResponse:
         # request into a buffered one.
         self.status_code = response.status_code
         self.ok = response.ok
+        self.headers = getattr(response, "headers", None) or {}
 
     def _diagnostic(self, stage: str, **fields) -> None:
         """Report only bounded metadata; diagnostics cannot affect the wire."""
@@ -358,6 +360,17 @@ class RetryingResponsesResponse:
                 recovery_response = True
 
             if retry_response is not None and retry_response.ok:
+                # Downstream headers cannot change during a transparent retry.
+                # Preserve the original failure if its accounting contract no
+                # longer matches; a new request can receive the actual metadata.
+                if bool(reasoning_accounting_headers(response)) != bool(
+                    reasoning_accounting_headers(retry_response)
+                ):
+                    self._diagnostic("retry_accounting_changed")
+                    retry_response.close()
+                    retry_response = None
+
+            if retry_response is not None and retry_response.ok:
                 if not self._replace_response(response, retry_response):
                     return
                 after_recovery = after_recovery or recovery_response
@@ -397,6 +410,9 @@ class OpenAIResponsesStreamHandler(SSEStreamHandler):
     # We pass the event header through verbatim and emit only the data line
     # ourselves (the original handler's convention).
     emit_event_header = False
+
+    def extra_response_headers(self) -> Dict[str, str]:
+        return reasoning_accounting_headers(self.response)
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)

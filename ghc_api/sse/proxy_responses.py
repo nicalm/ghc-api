@@ -4,11 +4,15 @@ import json
 from typing import Dict, Iterator
 
 from .base import SSEStreamHandler
+from .response_headers import reasoning_accounting_headers
 
 
 class ProxyResponsesStreamHandler(SSEStreamHandler):
     log_prefix = "[Configured Proxy Responses]"
     emit_event_header = False
+
+    def extra_response_headers(self) -> Dict[str, str]:
+        return reasoning_accounting_headers(self.response)
 
     def __init__(
         self,

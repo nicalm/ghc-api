@@ -194,6 +194,25 @@ auto_remove_encrypted_content_on_parse_error: false # If /v1/responses returns H
                               # Lossy; see "Encrypted Content Recovery" below.
 ```
 
+### Codex Responses accounting headers
+
+Responses passthrough forwards a real upstream `x-reasoning-included: true`
+declaration, including through the early-failure retry wrapper. Missing, false,
+empty, or unrecognized values are omitted: Codex interprets the header's presence
+as true. No authentication, cookies, or arbitrary upstream headers are forwarded.
+If a transparent retry changes this accounting declaration, the original failure
+is retained instead of forwarding success under an incompatible HTTP header.
+
+Native Codex requests carrying `X-Codex-Turn-Metadata` wait for the real upstream
+response headers. They do not enter the speculative pre-header keepalive path:
+once an SSE comment has committed the HTTP response, a later accounting header
+cannot be added. In-body keepalives, upstream timeouts, HTTP error statuses, and
+the existing bounded recovery policies still apply. The first HTTP byte for these
+requests therefore follows upstream header latency, not
+`responses_pre_header_grace`; the client's initial-response timeout must allow
+that latency. Clients without this Codex marker keep the existing pre-header
+keepalive behavior and its conservative missing-header fallback.
+
 ### Anthropic Messages → Responses wire profiles
 
 Responses backends do not all accept the same request dialect. Copilot's GPT
