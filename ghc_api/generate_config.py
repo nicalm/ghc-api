@@ -305,6 +305,31 @@ webiq_mcp_max_concurrent_streams: 4
 # Logging is on by default; MCP request/response bodies are never persisted.
 log_webiq_requests: true
 
+# Local images and Codex request byte budgets (both opt-in).
+# Images are served through a separate Streamable HTTP MCP at /mcp/images.
+# No-auth image tools accept loopback callers/hosts only. With auth enabled,
+# they require the same approved caller token as the model routes.
+image_tools:
+  enabled: false
+  allowed_roots: []  # Explicit absolute image directories; never an entire drive.
+  data_dir: ""      # Empty: <config_dir>/image-tools; keep outside your Git repo.
+  max_source_bytes: 33554432
+  max_pixels: 20000000
+  preview_max_bytes: 200000
+  preview_max_edge: 1024
+  context_budget_bytes: 4194304
+  store_max_bytes: 268435456
+  asset_ttl_seconds: 86400
+
+# Only /responses requests carrying X-Codex-Turn-Metadata are affected.
+# Byte limits include JSON escaping/Base64 and do not change token accounting.
+# These are engineering budgets, not claims about upstream capacity.
+codex_request_budget:
+  enabled: false
+  warn_bytes: 12582912
+  max_bytes: 20971520
+  rejected_ttl_seconds: 300
+
 # User Authentication
 # -------------------
 # When true, the LLM API endpoints (/v1/chat/completions, /v1/messages, /v1/responses,

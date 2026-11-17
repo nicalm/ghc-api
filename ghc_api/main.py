@@ -29,6 +29,7 @@ from .config import (
 )
 from .config_sync import print_sync_diff_status
 from .generate_config import generate_config_file
+from .media.config import apply_media_config
 from .state import state
 from .token_manager import (
     authenticate_github_device_flow,
@@ -302,6 +303,7 @@ def main():
         if 'enable_tool_call_recovery' in config:
             state.enable_tool_call_recovery = bool(config['enable_tool_call_recovery'])
         apply_anthropic_responses_config(config)
+        apply_media_config(config, state)
         if 'enable_responses_early_failure_retry' in config:
             state.enable_responses_early_failure_retry = bool(config['enable_responses_early_failure_retry'])
         if 'session_flush_interval' in config:

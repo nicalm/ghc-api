@@ -5,6 +5,8 @@ Global application state management
 import threading
 from typing import Dict, List, Optional
 
+from .media.config import ImageToolsConfig, RequestBudgetConfig
+
 from .config import (
     GITHUB_TOKEN,
     DEFAULT_VSCODE_VERSION,
@@ -16,6 +18,8 @@ from .config import (
 class State:
     """Global application state"""
     def __init__(self):
+        self.image_tools = ImageToolsConfig()
+        self.codex_request_budget = RequestBudgetConfig()
         self.github_token: str = GITHUB_TOKEN
         self.github_token_source: str = "environment" if GITHUB_TOKEN else "unconfigured"
         self.copilot_token: Optional[str] = None

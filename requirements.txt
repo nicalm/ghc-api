@@ -3,3 +3,4 @@ requests>=2.25.0
 PyYAML>=5.4.0
 tiktoken>=0.3.0
 waitress>=2.1.0
+Pillow>=10.4.0

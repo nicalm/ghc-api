@@ -19,3 +19,9 @@ build/
 
 # Generated benchmark artifacts.
 /benchmarks/results/
+
+# Image originals, derivatives and registries are local runtime data.
+/image-tools-data/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm

@@ -25,6 +25,7 @@ from ..auth import redact_auth_headers
 from ..cache import cache
 from ..counters import counters
 from ..encrypted_recovery import EncryptionRecovery
+from ..media.budget import RequestBudgetError, ResponsesBudget
 from ..config import chat_completions_model_support
 from ..sse import OpenAIResponsesStreamHandler, RetryingResponsesResponse
 from ..sse.keepalive import (
@@ -79,6 +80,14 @@ def _start_responses_post(headers: Dict, payload: Dict) -> BackgroundResult:
         stream=True,
         timeout=state.upstream_read_timeout,
     ), label="responses")
+
+
+def _post_responses(headers, payload, stream, budget=None):
+    url = f"{get_copilot_base_url()}/v1/responses"
+    if budget is not None:
+        return budget.post(url, headers, payload, stream)
+    return requests.post(url, headers=headers, json=payload, stream=stream,
+                         timeout=state.upstream_read_timeout)
 
 
 def _responses_keepalive() -> str:
@@ -175,6 +184,7 @@ def _build_responses_stream_handler(
     enable_vision: bool,
     encrypted_content_retry_attempted: bool = False,
     recovery=None,
+    budget=None,
 ) -> OpenAIResponsesStreamHandler:
     upstream_response = response
     recover_encrypted_content = (
@@ -186,13 +196,10 @@ def _build_responses_stream_handler(
         def retry_streaming_response():
             ensure_copilot_token()
             retry_headers = get_copilot_headers(enable_vision)
-            return requests.post(
-                f"{get_copilot_base_url()}/v1/responses",
-                headers=retry_headers,
-                json=payload,
-                stream=True,
-                timeout=state.upstream_read_timeout,
-            )
+            response = _post_responses(retry_headers, payload, True, budget)
+            if budget is not None:
+                handler.request_size = budget.metrics['request_bytes']
+            return response
 
         def retry_encrypted_content(error):
             nonlocal payload, encrypted_content_retry_attempted
@@ -1817,6 +1824,13 @@ def responses():
         )
         payload = recovery.prepare(payload)
 
+        budget = None
+        if state.codex_request_budget.enabled and 'X-Codex-Turn-Metadata' in request.headers:
+            budget = ResponsesBudget(state.codex_request_budget, user_id,
+                                     str(payload.get('prompt_cache_key') or ''),
+                                     f"{get_copilot_base_url()}/v1/responses", request_id)
+            g.codex_request_budget = budget
+
         # Non-streaming request
         connection_retries = max(0, state.max_connection_retries)
         last_connection_error = None
@@ -1891,13 +1905,9 @@ def responses():
             request_size = len(json.dumps(payload))
             try:
                 if response is None:
-                    response = requests.post(
-                        f"{get_copilot_base_url()}/v1/responses",
-                        headers=headers,
-                        json=payload,
-                        stream=use_streaming,
-                        timeout=state.upstream_read_timeout,
-                    )
+                    response = _post_responses(headers, payload, use_streaming, budget)
+                    if budget is not None:
+                        request_size = budget.metrics['request_bytes']
                 if use_streaming and response.ok:
                     return _build_responses_stream_handler(
                         response, payload, request_id, request_size,
@@ -1906,10 +1916,12 @@ def responses():
                         enable_vision,
                         encrypted_content_retry_attempted=encrypted_content_retry_attempted,
                         recovery=recovery,
+                        budget=budget,
                     ).stream()
                 if not response.ok:
                     print(f"Received error response for request {request_id}: {response.status_code} - {response.text}")
-                    log_error_request("/v1/responses", payload, response.text, response.status_code, client_ip)
+                    if budget is None or response.status_code != 413:
+                        log_error_request("/v1/responses", payload, response.text, response.status_code, client_ip)
                     if state.auto_remove_encrypted_content_on_parse_error:
                         retry_payload, removed_count = recovery.recover_http_error(
                             payload, response.status_code, response.text,
@@ -1989,7 +2001,8 @@ def responses():
         else:
             if recovery.has_attempted:
                 recovery.diagnostic({"stage": "recovery_http_error", "status_code": response.status_code})
-            log_error_request("/v1/responses", payload, response.text, response.status_code, client_ip)
+            if budget is None or response.status_code != 413:
+                log_error_request("/v1/responses", payload, response.text, response.status_code, client_ip)
             usage = {}
             try:
                 result = response.json()
@@ -1998,8 +2011,8 @@ def responses():
             cache.add_request(request_id, {
                 "request_headers": request_headers,
                 "client_ip": client_ip,
-                "original_request_body": original_request_body,
-                "request_body": payload,
+                "original_request_body": original_request_body if budget is None or response.status_code != 413 else {"omitted": "oversized request"},
+                "request_body": payload if budget is None or response.status_code != 413 else {"omitted": "oversized request"},
                 "response_body": result,
                 "model": original_model,
                 "translated_model": translated_model if translated_model != original_model else None,
@@ -2015,5 +2028,9 @@ def responses():
             })
             return Response(response.text, status=response.status_code, mimetype="application/json")
 
+    except RequestBudgetError as exc:
+        # A permanent, actionable 400. Never masquerade as a successful stream
+        # or a context-window error (which could induce another oversized compact).
+        return jsonify(exc.response_body()), 400
     except Exception as e:
         return jsonify({"error": str(e)}), 500

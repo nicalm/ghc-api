@@ -12,6 +12,8 @@ A Python Flask application that serves as a proxy server for GitHub Copilot API,
 - **Model Name Mapping**: Translate model names with exact and prefix-based matching
 - **Token Management**: Automatic GitHub Copilot token refresh
 - **Vision Support**: Handle image inputs and enable vision capabilities
+- **Bounded Local Image Tools**: Opt-in `/mcp/images` tools register original images and return small previews/crops, with per-caller assets and cumulative preview budgets
+- **Codex Request Byte Guard**: Opt-in exact outbound byte limits and short-lived HTTP 413 suppression, without modifying token accounting or conversation history
 - **Memory Caching**: Cache all requests and responses (up to 1000 entries)
 - **Web Dashboard**: Real-time statistics and request browser
 - **Request Details**: View full request/response bodies with JSON formatting
@@ -30,6 +32,7 @@ A Python Flask application that serves as a proxy server for GitHub Copilot API,
 
 ## Maintenance Guides
 
+- [Local image tools and Codex byte budgets](docs/IMAGE_TOOLS.md) - setup, MCP transport, data boundaries, error handling, upgrade checks and synthetic client acceptance
 - [Anthropic Messages to Responses web search compatibility](docs/decisions/ANTHROPIC_RESPONSES_WEB_SEARCH_COMPATIBILITY_DECISION.md) - why a native `web_search_call` is reported as a compatibility warning instead of a synthesised Anthropic block
 - [Async JSONL logging](ASYNC_JSONL_LOGGING.md) - agreed design for moving request/search file appends off the request thread (not yet implemented)
 - [Responses pre-header keepalive](docs/decisions/RESPONSES_PRE_HEADER_KEEPALIVE.md) - review notes and decisions behind the `/v1/responses` pre-header keepalive (PR #42): why upstream errors keep their HTTP status, why the synthetic event is `error`, and what is still open

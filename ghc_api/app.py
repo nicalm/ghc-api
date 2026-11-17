@@ -13,6 +13,7 @@ from .routes.dashboard import dashboard_bp
 from .routes.openai import openai_bp
 from .routes.proxy import proxy_bp
 from .routes.webiq import webiq_bp
+from .routes.image_tools import image_tools_bp, MCP_PATH, MAX_BODY_BYTES
 from .state import state
 
 
@@ -41,6 +42,7 @@ PROTECTED_PATHS = frozenset({
     "/v3/search/images",
     "/v3/search/classic",
     "/v3/mcp",
+    MCP_PATH,
 })
 
 
@@ -85,6 +87,8 @@ def create_app() -> Flask:
         It runs after the auth gate so an unauthenticated client cannot spend
         the scan on a protected path.
         """
+        if request.path == MCP_PATH and request.content_length is not None and request.content_length > MAX_BODY_BYTES:
+            return jsonify({'error': 'image_tool_request_too_large'}), 413
         if not request.is_json:
             return None
         if not exceeds_max_nesting(request.get_data(cache=True)):
@@ -117,6 +121,14 @@ def create_app() -> Flask:
     app.register_blueprint(agent_bp)
     app.register_blueprint(auth_bp)
     app.register_blueprint(webiq_bp)
+    app.register_blueprint(image_tools_bp)
+
+    @app.after_request
+    def _request_budget_headers(response):
+        budget = getattr(g, 'codex_request_budget', None)
+        if budget is not None:
+            response.headers.update(budget.headers())
+        return response
 
     # Error handlers
     @app.errorhandler(404)
